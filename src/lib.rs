@@ -89,12 +89,16 @@ pub struct MmapRawDescriptor(RawFd);
 pub struct MmapRawDescriptor(RawHandle);
 
 pub trait MmapAsRawDesc {
+  #[cfg(not(any(unix, windows)))]
+  fn as_raw_desc(&self) -> MmapRawDescriptor<'_>;
+
+  #[cfg(any(unix, windows))]
   fn as_raw_desc(&self) -> MmapRawDescriptor;
 }
 
 #[cfg(not(any(unix, windows)))]
 impl MmapAsRawDesc for &File {
-  fn as_raw_desc(&self) -> MmapRawDescriptor {
+  fn as_raw_desc(&self) -> MmapRawDescriptor<'_> {
     MmapRawDescriptor(self)
   }
 }
