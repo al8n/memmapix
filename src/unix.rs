@@ -443,7 +443,7 @@ impl MmapInner {
     self.len
   }
 
-  pub fn advise(
+  pub(crate) fn advise(
     &self,
     advice: crate::advice::RawAdvice,
     offset: usize,

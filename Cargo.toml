@@ -10,8 +10,8 @@ authors = [
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/al8n/memmapix-rs"
 documentation = "https://docs.rs/memmapix"
-description = "Cross-platform Rust API for memory-mapped file IO"
-keywords = ["mmap", "memory-map", "io", "file"]
+description = "A pure Rust library for cross-platform memory mapped IO, which replaces libc with rustix"
+keywords = ["mmap", "memmap2", "memory-map", "io", "file"]
 edition = "2021"
 rust-version = "1.63.0"
 

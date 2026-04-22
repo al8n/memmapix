@@ -165,7 +165,7 @@ impl MmapInner {
     copy: bool,
   ) -> io::Result<MmapInner> {
     let alignment = offset % allocation_granularity() as u64;
-    let aligned_offset = offset - alignment as u64;
+    let aligned_offset = offset - alignment;
     let aligned_len = len + alignment as usize;
     if aligned_len == 0 {
       // `CreateFileMappingW` documents:

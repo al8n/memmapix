@@ -233,10 +233,11 @@ impl MmapOptions {
   /// # fn main() -> std::io::Result<()> {
   /// let mmap = unsafe {
   ///     MmapOptions::new()
-  ///                 .len(9)
-  ///                 .map(&File::open("README.md")?)?
+  ///                 .len(6)
+  ///                 .offset(30)
+  ///                 .map(&File::open("LICENSE-APACHE")?)?
   /// };
-  /// assert_eq!(&b"# memmapix"[..], &mmap[..]);
+  /// assert_eq!(&b"Apache"[..], &mmap[..]);
   /// # Ok(())
   /// # }
   /// ```
@@ -712,9 +713,9 @@ impl MmapOptions {
 /// use std::fs::File;
 ///
 /// # fn main() -> std::io::Result<()> {
-/// let file = File::open("README.md")?;
+/// let file = File::open("LICENSE-APACHE")?;
 /// let mmap = unsafe { MmapOptions::new().map(&file)? };
-/// assert_eq!(b"# memmapix", &mmap[0..9]);
+/// assert_eq!(b"Apache License", &mmap[30..44]);
 /// # Ok(())
 /// # }
 /// ```
