@@ -1,0 +1,148 @@
+name: coverage
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths-ignore:
+      - 'COPYRIGHT'
+      - 'LICENSE-*'
+      - '**.md'
+      - '**.txt'
+  pull_request:
+    paths-ignore:
+      - 'COPYRIGHT'
+      - 'LICENSE-*'
+      - '**.md'
+      - '**.txt'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Matrix covers the per-OS split of memmapix's platform code:
+#
+# - linux-x86_64:   src/unix.rs + src/advice.rs, exercising rustix's
+#                   Linux mmap/madvise backend and the MAP_HUGE_*
+#                   constants pulled from linux-raw-sys.
+# - macos-aarch64:  src/unix.rs + src/advice.rs, exercising rustix's
+#                   Darwin mmap backend plus libc's Darwin-specific
+#                   `MADV_*` path (`MADV_FREE`, `MADV_FREE_REUSABLE`,
+#                   `MADV_FREE_REUSE`, `MADV_ZERO_WIRED_PAGES`).
+# - windows-x86_64: src/windows.rs, exercising the Win32 file mapping
+#                   APIs.
+#
+# On each runner we exclude the other OS's sources so they don't
+# register as uncovered lines. `src/stub.rs` is unreachable on any CI
+# runner (only compiled on cfg(not(any(unix, windows)))) and is
+# excluded everywhere.
+
+jobs:
+  coverage:
+    name: coverage (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Unix (Linux) ----
+          - os: ubuntu-latest
+            label: linux-x86_64
+            exclude_os: >-
+              --exclude-files 'src/windows.rs'
+              --exclude-files 'src/stub.rs'
+
+          # ---- Unix (macOS / aarch64) ----
+          - os: macos-latest
+            label: macos-aarch64
+            exclude_os: >-
+              --exclude-files 'src/windows.rs'
+              --exclude-files 'src/stub.rs'
+
+          # ---- Windows ----
+          - os: windows-latest
+            label: windows-x86_64
+            exclude_os: >-
+              --exclude-files 'src/unix.rs'
+              --exclude-files 'src/advice.rs'
+              --exclude-files 'src/stub.rs'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        # `llvm-tools-preview` is required by `cargo tarpaulin --engine
+        # llvm`, which is the only tarpaulin engine that works
+        # uniformly on Linux + macOS + Windows.
+        shell: bash
+        run: |
+          rustup toolchain install stable --component llvm-tools-preview --profile minimal
+          rustup default stable
+
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+
+      - name: Generate coverage
+        shell: bash
+        # --engine llvm:      works on all three OSes (ptrace is Linux-only).
+        # --all-features:     exercise every feature-gated impl leaf
+        #                     (only `stable_deref_trait` today, but this
+        #                     keeps the command future-proof).
+        # --run-types tests:  run `cargo test` targets only (skip doctests
+        #                     and benches).
+        # --ignore-tests:     omit test function bodies from the coverage
+        #                     percentage; measure the library, not the
+        #                     test harness.
+        # Lock-test parallelism: a few tests touch shared tempfiles and
+        # can flap when run in parallel. Force single-threaded execution,
+        # matching ci.yml.
+        run: |
+          mkdir -p coverage
+          cargo tarpaulin \
+            --engine llvm \
+            --all-features \
+            --run-types tests \
+            --ignore-tests \
+            ${{ matrix.exclude_os }} \
+            --out xml \
+            --output-dir coverage \
+            -- --test-threads 1
+        continue-on-error: false
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-${{ matrix.label }}
+          path: coverage/cobertura.xml
+
+  upload-codecov:
+    name: Upload merged coverage to Codecov
+    needs: coverage
+    runs-on: ubuntu-latest
+    if: always()
+    strategy:
+      fail-fast: false
+      matrix:
+        label:
+          - linux-x86_64
+          - macos-aarch64
+          - windows-x86_64
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download ${{ matrix.label }} report
+        uses: actions/download-artifact@v6
+        with:
+          name: coverage-${{ matrix.label }}
+          path: coverage/
+
+      - name: Upload ${{ matrix.label }} to Codecov
+        uses: codecov/codecov-action@v6
+        with:
+          files: coverage/cobertura.xml
+          flags: ${{ matrix.label }}
+          fail_ci_if_error: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
