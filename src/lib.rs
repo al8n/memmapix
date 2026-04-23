@@ -69,9 +69,9 @@ pub use crate::advice::{Advice, UncheckedAdvice};
 #[cfg(not(any(unix, windows)))]
 use std::fs::File;
 #[cfg(unix)]
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsFd, BorrowedFd};
 #[cfg(windows)]
-use std::os::windows::io::{AsRawHandle, RawHandle};
+use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::{
   fmt,
   io::{Error, ErrorKind, Result},
@@ -83,17 +83,26 @@ use std::{
 pub struct MmapRawDescriptor<'a>(&'a File);
 
 #[cfg(unix)]
-pub struct MmapRawDescriptor(RawFd);
+pub struct MmapRawDescriptor<'a>(BorrowedFd<'a>);
 
 #[cfg(windows)]
-pub struct MmapRawDescriptor(RawHandle);
+pub struct MmapRawDescriptor<'a>(BorrowedHandle<'a>);
 
+/// Types that can provide a borrowed file descriptor/handle to a memory map
+/// constructor.
+///
+/// The trait is implemented by anything that implements the I/O-safety
+/// traits [`AsFd`] (Unix) or [`AsHandle`] (Windows), which guarantees at the
+/// type-system level that the descriptor is open for the lifetime of the
+/// returned borrow. Bare `RawFd`/`RawHandle` integers intentionally do
+/// **not** implement this trait: safely obtaining a `BorrowedFd` /
+/// `BorrowedHandle` from a raw integer requires [`BorrowedFd::borrow_raw`] /
+/// [`BorrowedHandle::borrow_raw`], which are `unsafe fn`s whose validity
+/// precondition must be upheld by the caller. Users holding a bare raw
+/// descriptor should construct the borrow themselves in an `unsafe` block
+/// before calling into this crate.
 pub trait MmapAsRawDesc {
-  #[cfg(not(any(unix, windows)))]
   fn as_raw_desc(&self) -> MmapRawDescriptor<'_>;
-
-  #[cfg(any(unix, windows))]
-  fn as_raw_desc(&self) -> MmapRawDescriptor;
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -104,37 +113,48 @@ impl MmapAsRawDesc for &File {
 }
 
 #[cfg(unix)]
-impl MmapAsRawDesc for RawFd {
-  fn as_raw_desc(&self) -> MmapRawDescriptor {
-    MmapRawDescriptor(*self)
-  }
-}
-
-#[cfg(unix)]
-impl<T> MmapAsRawDesc for &T
-where
-  T: AsRawFd,
-{
-  fn as_raw_desc(&self) -> MmapRawDescriptor {
-    MmapRawDescriptor(self.as_raw_fd())
+impl<T: AsFd + ?Sized> MmapAsRawDesc for T {
+  fn as_raw_desc(&self) -> MmapRawDescriptor<'_> {
+    MmapRawDescriptor(self.as_fd())
   }
 }
 
 #[cfg(windows)]
-impl MmapAsRawDesc for RawHandle {
-  fn as_raw_desc(&self) -> MmapRawDescriptor {
-    MmapRawDescriptor(*self)
+impl<T: AsHandle + ?Sized> MmapAsRawDesc for T {
+  fn as_raw_desc(&self) -> MmapRawDescriptor<'_> {
+    MmapRawDescriptor(self.as_handle())
   }
 }
 
-#[cfg(windows)]
-impl<T> MmapAsRawDesc for &T
-where
-  T: AsRawHandle,
-{
-  fn as_raw_desc(&self) -> MmapRawDescriptor {
-    MmapRawDescriptor(self.as_raw_handle())
+/// Validates a range-scoped API's `offset`/`len` and reports whether the
+/// caller should invoke its OS backend.
+///
+/// Returns `Ok(true)` when the backend should be called, `Ok(false)` when
+/// the range is a valid no-op (`len == 0`), and `Err(InvalidInput)` when
+/// `offset + len` overflows or exceeds `map_len`.
+///
+/// The zero-length short-circuit prevents two hazards:
+///
+/// 1. When `offset == map_len && len == 0`, dispatching to the backend would
+///    materialize a one-past-the-end pointer via `ptr.offset(map_len)` /
+///    `ptr.add(map_len)`. Computing such a pointer is permitted by Rust,
+///    but handing it to the OS backend is at best noise and at worst
+///    ill-defined per the platform's API contract.
+/// 2. On Windows `FlushViewOfFile(ptr, 0)` is documented to flush "from
+///    the base address to the end of the mapping" — it is *not* a no-op.
+///    Calling safe `flush_range(o, 0)` must not silently become a
+///    full-range flush.
+fn check_range(offset: usize, len: usize, map_len: usize) -> Result<bool> {
+  let end = offset
+    .checked_add(len)
+    .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "offset + len overflows usize"))?;
+  if end > map_len {
+    return Err(Error::new(
+      ErrorKind::InvalidInput,
+      "offset + len exceeds the memory map's length",
+    ));
   }
+  Ok(len != 0)
 }
 
 /// A memory map builder, providing advanced options and flags for specifying memory map behavior.
@@ -639,6 +659,13 @@ impl MmapOptions {
 
   /// Creates a raw memory map.
   ///
+  /// Because [`MmapAsRawDesc`] is gated on [`AsFd`]/[`AsHandle`], the
+  /// descriptor passed in carries a compiler-checked validity guarantee
+  /// for the lifetime of the call — so this entry point is safe. Users
+  /// holding a bare `RawFd`/`RawHandle` integer must first wrap it in a
+  /// [`BorrowedFd::borrow_raw`]/[`BorrowedHandle::borrow_raw`] themselves
+  /// (both `unsafe`) and pass that in.
+  ///
   /// # Errors
   ///
   /// This method returns an error when the underlying system call fails, which can happen for a
@@ -662,6 +689,9 @@ impl MmapOptions {
   ///
   /// This is primarily useful to avoid intermediate `Mmap` instances when
   /// read-only access to files modified elsewhere are required.
+  ///
+  /// See [`MmapOptions::map_raw`] for the rationale of why this entry
+  /// point is safe despite handing out raw pointers.
   ///
   /// # Errors
   ///
@@ -835,9 +865,17 @@ impl Mmap {
   ///
   /// The offset and length must be in the bounds of the memory map.
   ///
+  /// # Errors
+  ///
+  /// Returns [`ErrorKind::InvalidInput`] if `offset + len` overflows or
+  /// exceeds the memory map's length.
+  ///
   /// See [madvise()](https://man7.org/linux/man-pages/man2/madvise.2.html) map page.
   #[cfg(unix)]
   pub fn advise_range(&self, advice: Advice, offset: usize, len: usize) -> Result<()> {
+    if !check_range(offset, len, self.inner.len())? {
+      return Ok(());
+    }
     self.inner.advise(advice.to_raw(), offset, len)
   }
 
@@ -1037,7 +1075,15 @@ impl MmapRaw {
   /// last modification timestamp) may not be updated. It is not guaranteed the only the changes
   /// in the specified range are flushed; other outstanding changes to the memory map may be
   /// flushed as well.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`ErrorKind::InvalidInput`] if `offset + len` overflows or
+  /// exceeds the memory map's length.
   pub fn flush_range(&self, offset: usize, len: usize) -> Result<()> {
+    if !check_range(offset, len, self.inner.len())? {
+      return Ok(());
+    }
     self.inner.flush(offset, len)
   }
 
@@ -1050,7 +1096,15 @@ impl MmapRaw {
   /// modification timestamp) may not be updated. It is not guaranteed that the only changes
   /// flushed are those in the specified range; other outstanding changes to the memory map may
   /// be flushed as well.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`ErrorKind::InvalidInput`] if `offset + len` overflows or
+  /// exceeds the memory map's length.
   pub fn flush_async_range(&self, offset: usize, len: usize) -> Result<()> {
+    if !check_range(offset, len, self.inner.len())? {
+      return Ok(());
+    }
     self.inner.flush_async(offset, len)
   }
 
@@ -1080,9 +1134,17 @@ impl MmapRaw {
   ///
   /// Only supported on Unix.
   ///
+  /// # Errors
+  ///
+  /// Returns [`ErrorKind::InvalidInput`] if `offset + len` overflows or
+  /// exceeds the memory map's length.
+  ///
   /// See [madvise()](https://man7.org/linux/man-pages/man2/madvise.2.html) map page.
   #[cfg(unix)]
   pub fn advise_range(&self, advice: Advice, offset: usize, len: usize) -> Result<()> {
+    if !check_range(offset, len, self.inner.len())? {
+      return Ok(());
+    }
     self.inner.advise(advice.to_raw(), offset, len)
   }
 
@@ -1308,7 +1370,15 @@ impl MmapMut {
   /// last modification timestamp) may not be updated. It is not guaranteed the only the changes
   /// in the specified range are flushed; other outstanding changes to the memory map may be
   /// flushed as well.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`ErrorKind::InvalidInput`] if `offset + len` overflows or
+  /// exceeds the memory map's length.
   pub fn flush_range(&self, offset: usize, len: usize) -> Result<()> {
+    if !check_range(offset, len, self.inner.len())? {
+      return Ok(());
+    }
     self.inner.flush(offset, len)
   }
 
@@ -1321,7 +1391,15 @@ impl MmapMut {
   /// modification timestamp) may not be updated. It is not guaranteed that the only changes
   /// flushed are those in the specified range; other outstanding changes to the memory map may
   /// be flushed as well.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`ErrorKind::InvalidInput`] if `offset + len` overflows or
+  /// exceeds the memory map's length.
   pub fn flush_async_range(&self, offset: usize, len: usize) -> Result<()> {
+    if !check_range(offset, len, self.inner.len())? {
+      return Ok(());
+    }
     self.inner.flush_async(offset, len)
   }
 
@@ -1401,9 +1479,17 @@ impl MmapMut {
   ///
   /// The offset and length must be in the bounds of the memory map.
   ///
+  /// # Errors
+  ///
+  /// Returns [`ErrorKind::InvalidInput`] if `offset + len` overflows or
+  /// exceeds the memory map's length.
+  ///
   /// See [madvise()](https://man7.org/linux/man-pages/man2/madvise.2.html) map page.
   #[cfg(unix)]
   pub fn advise_range(&self, advice: Advice, offset: usize, len: usize) -> Result<()> {
+    if !check_range(offset, len, self.inner.len())? {
+      return Ok(());
+    }
     self.inner.advise(advice.to_raw(), offset, len)
   }
 
@@ -1556,7 +1642,7 @@ mod test {
   #[cfg(unix)]
   use crate::advice::{Advice, UncheckedAdvice};
   #[cfg(unix)]
-  use std::os::unix::io::AsRawFd;
+  use std::os::unix::io::{AsRawFd, BorrowedFd};
   #[cfg(windows)]
   use std::os::windows::fs::OpenOptionsExt;
   use std::{
@@ -1620,7 +1706,13 @@ mod test {
 
     file.set_len(expected_len as u64).unwrap();
 
-    let mut mmap = unsafe { MmapMut::map_mut(file.as_raw_fd()).unwrap() };
+    // Exercise the raw-fd path by wrapping a bare RawFd in a BorrowedFd.
+    // Constructing the borrow is `unsafe` (caller asserts the fd is open);
+    // the map call itself is safe only in contract: it remains `unsafe fn`
+    // because of the file-modification UB caveat shared by all file-backed
+    // `map_*` variants.
+    let raw_fd = file.as_raw_fd();
+    let mut mmap = unsafe { MmapMut::map_mut(BorrowedFd::borrow_raw(raw_fd)).unwrap() };
     let len = mmap.len();
     assert_eq!(expected_len, len);
 
@@ -1744,6 +1836,67 @@ mod test {
     (&mut mmap[..]).write_all(write).unwrap();
     mmap.flush_async_range(0, write.len()).unwrap();
     mmap.flush_range(0, write.len()).unwrap();
+  }
+
+  #[test]
+  fn flush_range_rejects_out_of_bounds() {
+    let mmap = MmapMut::map_anon(128).unwrap();
+
+    let err = mmap.flush_range(0, 129).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    let err = mmap.flush_range(64, 65).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    let err = mmap.flush_range(usize::MAX, 1).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    let err = mmap.flush_async_range(0, 129).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    // An offset just past map_len is rejected even when len == 0.
+    let err = mmap.flush_range(129, 0).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    // Exact-fit boundary is accepted as a full-range flush.
+    mmap.flush_range(0, 128).unwrap();
+
+    // Zero-length ranges are no-ops and MUST NOT reach the backend — on
+    // Windows `FlushViewOfFile(ptr, 0)` is documented to flush from the
+    // base to the end of the mapping, and `ptr.add(map_len)` is one past
+    // the mapped view even if the `usize` arithmetic is in range.
+    mmap.flush_range(128, 0).unwrap();
+    mmap.flush_range(64, 0).unwrap();
+    mmap.flush_range(0, 0).unwrap();
+    mmap.flush_async_range(128, 0).unwrap();
+  }
+
+  #[test]
+  fn raw_flush_range_rejects_out_of_bounds() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("mmap_raw_range");
+    let file = OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create(true)
+      .truncate(true)
+      .open(path)
+      .unwrap();
+    file.set_len(64).unwrap();
+
+    let mmap = MmapRaw::map_raw(&file).unwrap();
+    let err = mmap.flush_range(0, 65).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    let err = mmap.flush_async_range(usize::MAX, 1).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+  }
+
+  #[test]
+  #[cfg(unix)]
+  fn advise_range_rejects_out_of_bounds() {
+    let mmap = MmapMut::map_anon(128).unwrap();
+    let err = mmap.advise_range(Advice::Normal, 0, 129).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
   }
 
   #[test]
@@ -2046,7 +2199,7 @@ mod test {
     File::create(&path).unwrap().write_all(b"abc123").unwrap();
 
     let mmap = MmapOptions::new()
-      .map_raw_read_only(&File::open(&path).unwrap())
+      .map_raw_read_only(File::open(&path).unwrap())
       .unwrap();
 
     assert_eq!(mmap.len(), 6);
@@ -2450,7 +2603,7 @@ mod test {
 
     // Drive the read-only entry point too so its body is counted.
     let ro = MmapOptions::new()
-      .map_raw_read_only(&File::open(&path).unwrap())
+      .map_raw_read_only(File::open(&path).unwrap())
       .unwrap();
     assert_eq!(ro.len(), 256);
   }
