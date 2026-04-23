@@ -2,12 +2,10 @@
 #![allow(non_snake_case)]
 
 use std::{
-  fs::File,
   io, mem,
-  mem::ManuallyDrop,
   os::{
     raw::c_void,
-    windows::io::{FromRawHandle, RawHandle},
+    windows::io::{AsRawHandle, BorrowedHandle, RawHandle},
   },
   ptr,
 };
@@ -135,6 +133,8 @@ extern "system" {
     lpflOldProtect: PDWORD,
   ) -> BOOL;
 
+  fn GetFileSizeEx(hFile: HANDLE, lpFileSize: *mut i64) -> BOOL;
+
   fn GetSystemInfo(lpSystemInfo: LPSYSTEM_INFO);
 }
 
@@ -229,11 +229,12 @@ impl MmapInner {
 
   pub fn map(
     len: usize,
-    handle: RawHandle,
+    handle: BorrowedHandle<'_>,
     offset: u64,
     _populate: bool,
     _no_reserve: bool,
   ) -> io::Result<MmapInner> {
+    let handle = handle.as_raw_handle();
     let write = protection_supported(handle, PAGE_READWRITE);
     let exec = protection_supported(handle, PAGE_EXECUTE_READ);
     let mut access = FILE_MAP_READ;
@@ -262,11 +263,12 @@ impl MmapInner {
 
   pub fn map_exec(
     len: usize,
-    handle: RawHandle,
+    handle: BorrowedHandle<'_>,
     offset: u64,
     _populate: bool,
     _no_reserve: bool,
   ) -> io::Result<MmapInner> {
+    let handle = handle.as_raw_handle();
     let write = protection_supported(handle, PAGE_READWRITE);
     let mut access = FILE_MAP_READ | FILE_MAP_EXECUTE;
     let protection = if write {
@@ -285,11 +287,12 @@ impl MmapInner {
 
   pub fn map_mut(
     len: usize,
-    handle: RawHandle,
+    handle: BorrowedHandle<'_>,
     offset: u64,
     _populate: bool,
     _no_reserve: bool,
   ) -> io::Result<MmapInner> {
+    let handle = handle.as_raw_handle();
     let exec = protection_supported(handle, PAGE_EXECUTE_READ);
     let mut access = FILE_MAP_READ | FILE_MAP_WRITE;
     let protection = if exec {
@@ -308,11 +311,12 @@ impl MmapInner {
 
   pub fn map_copy(
     len: usize,
-    handle: RawHandle,
+    handle: BorrowedHandle<'_>,
     offset: u64,
     _populate: bool,
     _no_reserve: bool,
   ) -> io::Result<MmapInner> {
+    let handle = handle.as_raw_handle();
     let exec = protection_supported(handle, PAGE_EXECUTE_READWRITE);
     let mut access = FILE_MAP_COPY;
     let protection = if exec {
@@ -331,11 +335,12 @@ impl MmapInner {
 
   pub fn map_copy_read_only(
     len: usize,
-    handle: RawHandle,
+    handle: BorrowedHandle<'_>,
     offset: u64,
     _populate: bool,
     _no_reserve: bool,
   ) -> io::Result<MmapInner> {
+    let handle = handle.as_raw_handle();
     let write = protection_supported(handle, PAGE_READWRITE);
     let exec = protection_supported(handle, PAGE_EXECUTE_READ);
     let mut access = FILE_MAP_COPY;
@@ -397,7 +402,9 @@ impl MmapInner {
           copy: false,
         })
       } else {
-        Err(io::Error::last_os_error())
+        let err = io::Error::last_os_error();
+        UnmapViewOfFile(ptr);
+        Err(err)
       }
     }
   }
@@ -525,11 +532,16 @@ fn allocation_granularity() -> usize {
   }
 }
 
-pub fn file_len(handle: RawHandle) -> io::Result<u64> {
-  // SAFETY: We must not close the passed-in fd by dropping the File we create,
-  // we ensure this by immediately wrapping it in a ManuallyDrop.
+pub fn file_len(handle: BorrowedHandle<'_>) -> io::Result<u64> {
+  // `GetFileSizeEx` only needs a valid, open handle for the call duration —
+  // the `BorrowedHandle` supplied by the caller carries that invariant at
+  // the type level (see `AsHandle`). Unlike `File::from_raw_handle`, we do
+  // not claim ownership and will not close the handle on drop.
   unsafe {
-    let file = ManuallyDrop::new(File::from_raw_handle(handle));
-    Ok(file.metadata()?.len())
+    let mut size: i64 = 0;
+    if GetFileSizeEx(handle.as_raw_handle() as HANDLE, &mut size) == 0 {
+      return Err(io::Error::last_os_error());
+    }
+    Ok(size as u64)
   }
 }

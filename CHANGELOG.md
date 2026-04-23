@@ -4,6 +4,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+`memmapix` is a fork of [`memmap2`](https://github.com/RazrFalcon/memmap2-rs)
+that swaps `libc` for `rustix`. The entries below marked `[memmapix]` track
+changes made in this fork; the remaining entries document the inherited
+`memmap2` history up to the fork point. Note that `memmapix` uses its own
+version line: the `[memmapix] 0.9.0` entry below is unrelated to `memmap2`'s
+`0.9.0` further down.
+
+## [0.9.0] - 2026-04-23
+### [memmapix] Fixed
+- Validate `offset + len` in the safe `flush_range`, `flush_async_range`, and
+  `advise_range` methods of `Mmap`, `MmapMut`, and `MmapRaw`. Out-of-bounds or
+  overflowing inputs now return `ErrorKind::InvalidInput` instead of reaching
+  unchecked pointer arithmetic in the Unix/Windows backends.
+- Close a soundness hole in `MmapOptions::map_raw`/`map_raw_read_only` and
+  `MmapRaw::map_raw`: previously a safe caller could pass a bare
+  `RawFd`/`RawHandle` that would reach `File::from_raw_fd` (claims ownership)
+  or `BorrowedFd::borrow_raw` (requires a valid open descriptor), violating
+  an unsafe precondition from safe code. `MmapAsRawDesc` is now gated on the
+  I/O-safety traits (`AsFd` on Unix, `AsHandle` on Windows), which give a
+  compiler-checked "descriptor is open" invariant on the borrow handed to
+  the OS backend. Safe callers passing `&File` / `File` / `BorrowedFd` work
+  unchanged; users holding a bare raw integer now construct a
+  `BorrowedFd::borrow_raw` / `BorrowedHandle::borrow_raw` themselves in an
+  `unsafe` block, which is where the validity precondition belongs. This
+  also drops the `FromRawFd`/`FromRawHandle` ownership claim previously made
+  by `file_len`.
+- Call `UnmapViewOfFile` before returning when `VirtualProtect` fails in the
+  Windows anonymous-map path, fixing a view leak.
+
+### [memmapix] Changed (breaking — soundness fix)
+- `impl MmapAsRawDesc for RawFd` / `impl MmapAsRawDesc for RawHandle` are
+  removed. Use `AsFd` / `AsHandle` types (e.g. `&File`, `BorrowedFd`,
+  `BorrowedHandle`) with the existing `map_*` methods. If you only have a
+  raw integer, wrap it with `unsafe { BorrowedFd::borrow_raw(fd) }` (or the
+  Windows equivalent) before calling in.
+- The `AsRawFd`/`AsRawHandle` bound on the blanket `MmapAsRawDesc` impl is
+  replaced with `AsFd`/`AsHandle`. Standard-library types such as `File`
+  implement both, so callers passing `&File` are unaffected.
+- Internal: `os::file_len` and `os::MmapInner::new` / `map*` now take
+  `BorrowedFd<'_>` / `BorrowedHandle<'_>` instead of the raw types. No
+  `BorrowedFd::borrow_raw` / `BorrowedHandle::borrow_raw` call remains on
+  any code path reachable from a safe API.
+
 ## [0.9.10] - 2026-02-15
 ### Fixed
 - Fix compilation on AIX targets.

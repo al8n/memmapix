@@ -1,16 +1,11 @@
 use std::{
-  fs::File,
   io,
-  mem::ManuallyDrop,
-  os::unix::io::{FromRawFd, RawFd},
+  os::unix::io::BorrowedFd,
   ptr,
   sync::atomic::{AtomicUsize, Ordering},
 };
 
-use rustix::{
-  fd::BorrowedFd,
-  mm::{MapFlags, MprotectFlags, MsyncFlags, ProtFlags},
-};
+use rustix::mm::{MapFlags, MprotectFlags, MsyncFlags, ProtFlags};
 
 #[cfg(any(
   all(target_os = "linux", not(target_arch = "mips")),
@@ -77,7 +72,7 @@ impl MmapInner {
     len: usize,
     prot: ProtFlags,
     flags: MapFlags,
-    file: RawFd,
+    file: BorrowedFd<'_>,
     offset: u64,
   ) -> io::Result<MmapInner> {
     let alignment = offset % page_size() as u64;
@@ -86,8 +81,7 @@ impl MmapInner {
     let (map_len, map_offset) = Self::adjust_mmap_params(len, alignment as usize)?;
 
     unsafe {
-      let fd = BorrowedFd::borrow_raw(file);
-      match rustix::mm::mmap(ptr::null_mut(), map_len, prot, flags, fd, aligned_offset) {
+      match rustix::mm::mmap(ptr::null_mut(), map_len, prot, flags, file, aligned_offset) {
         Ok(ptr) => Ok(Self::from_raw_parts(ptr, len, map_offset)),
         Err(e) => Err(io::Error::from_raw_os_error(e.raw_os_error())),
       }
@@ -217,7 +211,7 @@ impl MmapInner {
 
   pub fn map(
     len: usize,
-    file: RawFd,
+    file: BorrowedFd<'_>,
     offset: u64,
     populate: bool,
     no_reserve: bool,
@@ -243,7 +237,7 @@ impl MmapInner {
 
   pub fn map_exec(
     len: usize,
-    file: RawFd,
+    file: BorrowedFd<'_>,
     offset: u64,
     populate: bool,
     no_reserve: bool,
@@ -269,7 +263,7 @@ impl MmapInner {
 
   pub fn map_mut(
     len: usize,
-    file: RawFd,
+    file: BorrowedFd<'_>,
     offset: u64,
     populate: bool,
     no_reserve: bool,
@@ -295,7 +289,7 @@ impl MmapInner {
 
   pub fn map_copy(
     len: usize,
-    file: RawFd,
+    file: BorrowedFd<'_>,
     offset: u64,
     populate: bool,
     no_reserve: bool,
@@ -321,7 +315,7 @@ impl MmapInner {
 
   pub fn map_copy_read_only(
     len: usize,
-    file: RawFd,
+    file: BorrowedFd<'_>,
     offset: u64,
     populate: bool,
     no_reserve: bool,
@@ -564,11 +558,16 @@ fn page_size() -> usize {
   }
 }
 
-pub fn file_len(file: RawFd) -> io::Result<u64> {
-  // SAFETY: We must not close the passed-in fd by dropping the File we create,
-  // we ensure this by immediately wrapping it in a ManuallyDrop.
-  unsafe {
-    let file = ManuallyDrop::new(File::from_raw_fd(file));
-    Ok(file.metadata()?.len())
-  }
+pub fn file_len(file: BorrowedFd<'_>) -> io::Result<u64> {
+  // `rustix::fs::fstat` dispatches to `fstat64` on Linux/emscripten/l4re,
+  // preserving 64-bit offsets on 32-bit targets. The caller's `BorrowedFd`
+  // carries a compiler-checked guarantee that the descriptor is open for
+  // the duration of the borrow — which is exactly the invariant `fstat`
+  // needs — so no `unsafe` construction is required at this layer. The
+  // descriptor validity precondition lives at the boundary where the
+  // `BorrowedFd` was first obtained (e.g. `AsFd::as_fd` on a `File`, which
+  // is safe; or `BorrowedFd::borrow_raw` in caller code, which is unsafe).
+  rustix::fs::fstat(file)
+    .map(|stat| stat.st_size as u64)
+    .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
 }
