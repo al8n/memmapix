@@ -16,7 +16,11 @@ version line: the `[memmapix] 0.9.0` entry below is unrelated to `memmap2`'s
 - Validate `offset + len` in the safe `flush_range`, `flush_async_range`, and
   `advise_range` methods of `Mmap`, `MmapMut`, and `MmapRaw`. Out-of-bounds or
   overflowing inputs now return `ErrorKind::InvalidInput` instead of reaching
-  unchecked pointer arithmetic in the Unix/Windows backends.
+  unchecked pointer arithmetic in the Unix/Windows backends. Zero-length
+  ranges short-circuit before the backend call, both to avoid materializing
+  a one-past-the-end pointer and because `FlushViewOfFile(ptr, 0)` on
+  Windows is documented to flush "from base to end of the mapping" rather
+  than being a no-op.
 - Close a soundness hole in `MmapOptions::map_raw`/`map_raw_read_only` and
   `MmapRaw::map_raw`: previously a safe caller could pass a bare
   `RawFd`/`RawHandle` that would reach `File::from_raw_fd` (claims ownership)

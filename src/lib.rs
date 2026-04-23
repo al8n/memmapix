@@ -126,10 +126,25 @@ impl<T: AsHandle + ?Sized> MmapAsRawDesc for T {
   }
 }
 
-/// Ensures `offset + len` fits inside `map_len` without overflow. Safe
-/// range-scoped APIs call this before delegating to the OS backend, which
-/// would otherwise reach unchecked pointer arithmetic on out-of-bounds input.
-fn check_range(offset: usize, len: usize, map_len: usize) -> Result<()> {
+/// Validates a range-scoped API's `offset`/`len` and reports whether the
+/// caller should invoke its OS backend.
+///
+/// Returns `Ok(true)` when the backend should be called, `Ok(false)` when
+/// the range is a valid no-op (`len == 0`), and `Err(InvalidInput)` when
+/// `offset + len` overflows or exceeds `map_len`.
+///
+/// The zero-length short-circuit prevents two hazards:
+///
+/// 1. When `offset == map_len && len == 0`, dispatching to the backend would
+///    materialize a one-past-the-end pointer via `ptr.offset(map_len)` /
+///    `ptr.add(map_len)`. Computing such a pointer is permitted by Rust,
+///    but handing it to the OS backend is at best noise and at worst
+///    ill-defined per the platform's API contract.
+/// 2. On Windows `FlushViewOfFile(ptr, 0)` is documented to flush "from
+///    the base address to the end of the mapping" — it is *not* a no-op.
+///    Calling safe `flush_range(o, 0)` must not silently become a
+///    full-range flush.
+fn check_range(offset: usize, len: usize, map_len: usize) -> Result<bool> {
   let end = offset
     .checked_add(len)
     .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "offset + len overflows usize"))?;
@@ -139,7 +154,7 @@ fn check_range(offset: usize, len: usize, map_len: usize) -> Result<()> {
       "offset + len exceeds the memory map's length",
     ));
   }
-  Ok(())
+  Ok(len != 0)
 }
 
 /// A memory map builder, providing advanced options and flags for specifying memory map behavior.
@@ -858,7 +873,9 @@ impl Mmap {
   /// See [madvise()](https://man7.org/linux/man-pages/man2/madvise.2.html) map page.
   #[cfg(unix)]
   pub fn advise_range(&self, advice: Advice, offset: usize, len: usize) -> Result<()> {
-    check_range(offset, len, self.inner.len())?;
+    if !check_range(offset, len, self.inner.len())? {
+      return Ok(());
+    }
     self.inner.advise(advice.to_raw(), offset, len)
   }
 
@@ -1064,7 +1081,9 @@ impl MmapRaw {
   /// Returns [`ErrorKind::InvalidInput`] if `offset + len` overflows or
   /// exceeds the memory map's length.
   pub fn flush_range(&self, offset: usize, len: usize) -> Result<()> {
-    check_range(offset, len, self.inner.len())?;
+    if !check_range(offset, len, self.inner.len())? {
+      return Ok(());
+    }
     self.inner.flush(offset, len)
   }
 
@@ -1083,7 +1102,9 @@ impl MmapRaw {
   /// Returns [`ErrorKind::InvalidInput`] if `offset + len` overflows or
   /// exceeds the memory map's length.
   pub fn flush_async_range(&self, offset: usize, len: usize) -> Result<()> {
-    check_range(offset, len, self.inner.len())?;
+    if !check_range(offset, len, self.inner.len())? {
+      return Ok(());
+    }
     self.inner.flush_async(offset, len)
   }
 
@@ -1121,7 +1142,9 @@ impl MmapRaw {
   /// See [madvise()](https://man7.org/linux/man-pages/man2/madvise.2.html) map page.
   #[cfg(unix)]
   pub fn advise_range(&self, advice: Advice, offset: usize, len: usize) -> Result<()> {
-    check_range(offset, len, self.inner.len())?;
+    if !check_range(offset, len, self.inner.len())? {
+      return Ok(());
+    }
     self.inner.advise(advice.to_raw(), offset, len)
   }
 
@@ -1353,7 +1376,9 @@ impl MmapMut {
   /// Returns [`ErrorKind::InvalidInput`] if `offset + len` overflows or
   /// exceeds the memory map's length.
   pub fn flush_range(&self, offset: usize, len: usize) -> Result<()> {
-    check_range(offset, len, self.inner.len())?;
+    if !check_range(offset, len, self.inner.len())? {
+      return Ok(());
+    }
     self.inner.flush(offset, len)
   }
 
@@ -1372,7 +1397,9 @@ impl MmapMut {
   /// Returns [`ErrorKind::InvalidInput`] if `offset + len` overflows or
   /// exceeds the memory map's length.
   pub fn flush_async_range(&self, offset: usize, len: usize) -> Result<()> {
-    check_range(offset, len, self.inner.len())?;
+    if !check_range(offset, len, self.inner.len())? {
+      return Ok(());
+    }
     self.inner.flush_async(offset, len)
   }
 
@@ -1460,7 +1487,9 @@ impl MmapMut {
   /// See [madvise()](https://man7.org/linux/man-pages/man2/madvise.2.html) map page.
   #[cfg(unix)]
   pub fn advise_range(&self, advice: Advice, offset: usize, len: usize) -> Result<()> {
-    check_range(offset, len, self.inner.len())?;
+    if !check_range(offset, len, self.inner.len())? {
+      return Ok(());
+    }
     self.inner.advise(advice.to_raw(), offset, len)
   }
 
@@ -1825,9 +1854,21 @@ mod test {
     let err = mmap.flush_async_range(0, 129).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
-    // Exact-fit boundary is accepted.
+    // offset just past map_len with a positive len is rejected.
+    let err = mmap.flush_range(129, 0).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    // Exact-fit boundary is accepted as a full-range flush.
     mmap.flush_range(0, 128).unwrap();
+
+    // Zero-length ranges are no-ops and MUST NOT reach the backend — on
+    // Windows `FlushViewOfFile(ptr, 0)` is documented to flush from the
+    // base to the end of the mapping, and `ptr.add(map_len)` is one past
+    // the mapped view even if the `usize` arithmetic is in range.
     mmap.flush_range(128, 0).unwrap();
+    mmap.flush_range(64, 0).unwrap();
+    mmap.flush_range(0, 0).unwrap();
+    mmap.flush_async_range(128, 0).unwrap();
   }
 
   #[test]
