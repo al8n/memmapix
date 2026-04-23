@@ -1854,7 +1854,7 @@ mod test {
     let err = mmap.flush_async_range(0, 129).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
-    // offset just past map_len with a positive len is rejected.
+    // An offset just past map_len is rejected even when len == 0.
     let err = mmap.flush_range(129, 0).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
